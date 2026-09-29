@@ -366,6 +366,19 @@ void emit_inline_bind_params(Compiler *c, Scope *m, int args, const int *argv, i
   g_n_argov = argov_saved;
 }
 
+/* Whether method `mi`'s own body reads or writes an instance variable. */
+static int scope_uses_ivars(Compiler *c, int mi) {
+  const NodeTable *nt = c->nt;
+  for (int nid = 0; nid < nt->count; nid++) {
+    if (c->nscope[nid] != mi) continue;
+    NodeKind k = nt_kind(nt, nid);
+    if (k == NK_InstanceVariableReadNode || k == NK_InstanceVariableWriteNode ||
+        k == NK_InstanceVariableOperatorWriteNode || k == NK_InstanceVariableOrWriteNode)
+      return 1;
+  }
+  return 0;
+}
+
 int emit_inline_call_x(Compiler *c, int id, Buf *b, int indent, int as_expr) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -400,6 +413,15 @@ int emit_inline_call_x(Compiler *c, int id, Buf *b, int indent, int as_expr) {
       if (mi >= 0) cm_class = g_class_body_id;
     }
     if (mi < 0) mi = comp_method_index(c, name);   /* free function */
+    /* A method of a module included at the top level is callable bare, like
+       a free function. A yielding one exists only inlined, so a call left to
+       the top-level-include arm in emit_call named a function that was never
+       emitted and the link failed. One that touches an instance variable is
+       left to that arm, which refuses it: main holds no module state. */
+    if (mi < 0) {
+      int imi = comp_included_method_index(c, name);
+      if (imi >= 0 && !c->scopes[imi].is_cmethod && !scope_uses_ivars(c, imi)) mi = imi;
+    }
     if (mi < 0) return 0;
   }
   else {
