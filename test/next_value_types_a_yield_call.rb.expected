@@ -1,0 +1,9 @@
+true
+nil
+true
+"tail"
+5
+[2]
+true
+5
+NoMethodError: undefined method 'save' for an instance of Gadget
