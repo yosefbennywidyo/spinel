@@ -8185,6 +8185,22 @@ TyKind infer_uncached(Compiler *c, int id) {
         for (int e = 0; e < en; e++)
           if (value_arm_is(nt, ev[e], id)) return TY_POLY;
       }
+      /* An argument to a method the program defines likewise: its parameter
+         took the first site's type, and the other site's value was converted
+         to it at run time. `show(yield)` with a String block at one site and a
+         Float block at another raised TypeError where CRuby prints both. Only
+         a user method: a builtin operator on the yield (`yield + yield`) is
+         lowered per site to its concrete form, which a poly operand does not
+         fit. */
+      NT_FOREACH_KIND(nt, NK_CallNode, w) {
+        int an = nt_ref(nt, w, "arguments");
+        if (an < 0) continue;
+        const char *wn = nt_str(nt, w, "name");
+        if (!wn || !an_user_defines_method(c, wn)) continue;
+        int ac = 0; const int *av = nt_arr(nt, an, "arguments", &ac);
+        for (int e = 0; e < ac; e++)
+          if (value_arm_is(nt, av[e], id)) return TY_POLY;
+      }
       /* A yield whose value leaves through an ENSURE frame is in the same
          position as one written to a local, for the same reason: the frame
          carries the value in a slot of its own, and that slot settles its type
