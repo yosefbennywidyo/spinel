@@ -1,0 +1,182 @@
+name: gate-shards
+
+# The legs of `make gate` (Makefile: gate-test, gate-bench, gate-optcarrot,
+# gate-rubyspec, gate-props) split into parallel jobs, for a contributor's
+# fork. Lives only on `gate/**` branches: a branch = the PR's commits plus
+# this file, so the PR itself never carries it and the fork's master stays
+# identical to upstream.
+#
+# The final `trailer` job (added 2026-10-07) turns a green run into the
+# `Gate:` commit trailer upstream's gate-trailer.yml checks for
+# (tools/gate.rb), without ever running `make gate` in one place: it
+# recomputes `git merge-tree <upstream master> <PR commit>` itself (the
+# same operation the checker repeats later, so the two must agree whatever
+# upstream/master does afterward) and sums the `Tests:` lines the corpus
+# shards left as artifacts, then amends and pushes the PR branch itself --
+# not this gate/** branch, which the trailer must never carry. `actions/
+# checkout` always names the repo the workflow runs in `origin`, no matter
+# what any clone elsewhere calls it; this gate/** branch only ever exists
+# on the fork (see `on:` above), so that push lands on the fork, never
+# upstream. The job prints `git remote -v` first so the log says so too.
+on:
+  push:
+    branches: ['gate/**']
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  leg:
+    name: ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # gate-test: `make test OPT=-O1`, the corpus in 8 slices; slice 1
+          # also runs the C-side test legs `test` carries.
+          - { leg: "test 1/8", cmd: "make -j$(nproc) test TEST_SHARD=1/8 OPT=-O1" }
+          - { leg: "test 2/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=2/8 OPT=-O1" }
+          - { leg: "test 3/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=3/8 OPT=-O1" }
+          - { leg: "test 4/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=4/8 OPT=-O1" }
+          - { leg: "test 5/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=5/8 OPT=-O1" }
+          - { leg: "test 6/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=6/8 OPT=-O1" }
+          - { leg: "test 7/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=7/8 OPT=-O1" }
+          - { leg: "test 8/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=8/8 OPT=-O1" }
+          # gate-rubyspec: rubyspec-gate, one suite per job. Each example is
+          # its own compile + run, so a job lasts about its example count
+          # (language 791, string 657, array 522, hash 195, integer 170,
+          # range 111). run.sh's default RUBYSPEC_JOBS is nproc-2, which is
+          # 2 workers on a 4-vCPU runner; all of them are used here.
+          - { leg: "rubyspec language", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='language'" }
+          - { leg: "rubyspec string", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/string'" }
+          - { leg: "rubyspec array", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/array'" }
+          - { leg: "rubyspec hash", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/hash'" }
+          - { leg: "rubyspec integer", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/integer'" }
+          - { leg: "rubyspec range", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/range'" }
+          # gate-props
+          - { leg: "props", cmd: "make -j$(nproc) build/spinel-work && make gate-props" }
+          # gate-bench, gate-optcarrot
+          - { leg: "bench", cmd: "make gate-bench" }
+          - { leg: "optcarrot", cmd: "make gate-optcarrot" }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - name: Fetch libprism sources
+        run: make deps
+      - name: Build
+        run: make -j$(nproc) all
+      - name: ${{ matrix.leg }}
+        run: |
+          set -o pipefail
+          ${{ matrix.cmd }} 2>&1 | tee leg.log
+      - name: Summary
+        if: always()
+        run: |
+          grep -E 'Tests:|scale-test|rubyspec-gate|bench|optcarrot|checksum|: pass|FAIL|ERR' leg.log | tail -40 || true
+      # Only the `make test`/`test-corpus` legs produce a `Tests: N pass, M
+      # fail, K error` line (the number tools/gate.rb's own `stamp` records
+      # from build/test-results/*.ok); the other legs have no such count, so
+      # an empty summary.txt from them is correct, not a miss.
+      - name: Capture result for the trailer job
+        if: always()
+        run: |
+          mkdir -p result
+          grep -E 'Tests: [0-9]+ pass' leg.log > result/summary.txt || true
+          echo "${{ matrix.leg }}" > result/leg.txt
+          echo "${{ job.status }}" > result/status.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ strategy.job-index }}
+          path: result
+          retention-days: 1
+
+  trailer:
+    needs: leg
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      # Evidence in the log of exactly where the push below lands: the repo
+      # actions/checkout just cloned as "origin", whatever this is called
+      # anywhere else. This branch only exists on the fork (see the on:
+      # trigger above), so this must print the fork, never matz/spinel.
+      - name: Show which repo "origin" is in this job
+        run: |
+          git remote -v
+          echo "github.repository = $GITHUB_REPOSITORY"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+      # The "master" and "commit" the trailer names: commit is this gate/**
+      # branch's parent, i.e. the PR branch's own tip, the gate/** branch
+      # being exactly that commit plus the one before this adding this
+      # workflow file (see the file-level comment -- it must never reach
+      # the PR). "master" is upstream's own tip right now: tools/gate.rb's
+      # verify step re-derives the tree from the master commit the trailer
+      # names, not from whatever upstream/master is when it runs, so this
+      # only has to be internally consistent with the tree computed below,
+      # not "current" by the time Matz looks at it.
+      - name: Resolve commit, master and the merged tree
+        id: info
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/matz/spinel.git
+          git fetch --quiet upstream master
+          master=$(git rev-parse upstream/master)
+          commit=$(git rev-parse HEAD~1)
+          tree=$(git merge-tree --write-tree "$master" "$commit")
+          echo "master=$master" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+      # Sums every "test N/8" shard's corpus count; the other legs left an
+      # empty summary.txt and add nothing, by design (see the leg job).
+      - name: Sum the corpus test counts
+        id: tests
+        run: |
+          set -euo pipefail
+          pass=0; bad=0
+          while IFS= read -r f; do
+            p=$(grep -oP '[0-9]+(?= pass)' "$f" || true)
+            fl=$(grep -oP '[0-9]+(?= fail)' "$f" || true)
+            er=$(grep -oP '[0-9]+(?= error)' "$f" || true)
+            [ -n "$p" ] && pass=$((pass + p))
+            [ -n "$fl" ] && bad=$((bad + fl))
+            [ -n "$er" ] && bad=$((bad + er))
+          done < <(find results -name summary.txt)
+          [ "$pass" -gt 0 ] || { echo "no corpus Tests: line found in any artifact" >&2; exit 1; }
+          echo "pass=$pass" >> "$GITHUB_OUTPUT"
+          echo "bad=$bad" >> "$GITHUB_OUTPUT"
+      - name: Write the Gate trailer onto the PR branch and push it to the fork
+        env:
+          MASTER: ${{ steps.info.outputs.master }}
+          COMMIT: ${{ steps.info.outputs.commit }}
+          TREE: ${{ steps.info.outputs.tree }}
+          PASS: ${{ steps.tests.outputs.pass }}
+          BAD: ${{ steps.tests.outputs.bad }}
+        run: |
+          set -euo pipefail
+          pr_branch="${GITHUB_REF_NAME#gate/}"
+          [ "$pr_branch" != "$GITHUB_REF_NAME" ] || { echo "ref $GITHUB_REF_NAME has no gate/ prefix" >&2; exit 1; }
+          git checkout --quiet "$COMMIT"
+          kind=clang; cc --version 2>/dev/null | head -1 | grep -qi clang || kind=gcc
+          ver=$(cc -dumpfullversion 2>/dev/null || cc -dumpversion)
+          platform="linux-$(uname -m) ${kind}-${ver}"
+          msg=$(mktemp)
+          git log -1 --format=%B > "$msg"
+          git interpret-trailers --in-place --if-exists replace --trailer \
+            "Gate: green tree ${TREE:0:12} master ${MASTER:0:12} (${platform}) tests ${PASS}/${BAD}" "$msg"
+          git -c user.name="$(git log -1 --format=%an "$COMMIT")" -c user.email="$(git log -1 --format=%ae "$COMMIT")" \
+            commit --amend -F "$msg" --date="$(git log -1 --format=%ad "$COMMIT")"
+          echo "about to update origin (shown above) branch $pr_branch"
+          git push --force origin "HEAD:${pr_branch}"
