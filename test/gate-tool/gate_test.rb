@@ -165,6 +165,43 @@ Dir.mktmpdir("gate-tool-test") do |dir|
   ENV["LC_ALL"] = locale
 end
 
+# --shard and merge: shard reports from one tree merge into one verdict, and
+# every way a shard set can be incomplete or red is refused.
+ok(Gate.parse_shard("3/17") == [3, 17], "parse_shard reads K/N")
+ok(Gate.parse_shard("0/4").nil? && Gate.parse_shard("5/4").nil? && Gate.parse_shard("x").nil?, "parse_shard refuses K outside 1..N")
+Dir.mktmpdir("gate-merge") do |d|
+  tree, master = "a" * 40, "b" * 40
+  legs = %w[gate-bench gate-optcarrot gate-rubyboy gate-props gate-rubyspec].map do |t|
+    { tree: tree, master: master, target: t, shard: "", rc: "0", pass: "0", fail: "0", error: "0" }
+  end
+  shards = ->(n, overrides = {}) do
+    (1..n).map do |k|
+      { tree: tree, master: master, target: "gate-test", shard: "#{k}/#{n}", rc: "0", pass: "10", fail: "0", error: "0" }
+        .merge(overrides.fetch(k, {}))
+    end
+  end
+  write = lambda do |name, rows|
+    rows.each_with_index.map do |row, i|
+      path = File.join(d, "#{name}-#{i}.report")
+      Gate.write_report(path, row)
+      path
+    end
+  end
+  merged = ->(rows) { capture { Gate.merge(write.(rows.first, rows.last)) } }
+  v, out, _ = merged.(["ok", legs + shards.(3)])
+  ok(v == 0 && out.include?("Tests: 30 pass, 0 fail, 0 error") && out.include?("gate-sharded: ALL GREEN"), "merge passes a complete shard set and names its verdict gate-sharded")
+  v, _, err = merged.(["missing", legs + shards.(3).reject { _1[:shard] == "2/3" }])
+  ok(v == 1 && err.include?("missing shards 2 of 3"), "merge refuses a shard set missing one slice")
+  v, _, err = merged.(["red-shard", legs + shards.(3, 2 => { rc: "1" })])
+  ok(v == 1 && err.include?("shard 2/3 rc=1"), "merge refuses a shard whose run failed")
+  v, _, err = merged.(["fail", legs + shards.(3, 1 => { fail: "2" })])
+  ok(v == 1 && err.include?("tests: 2 fail"), "merge refuses a shard with failing tests")
+  v, _, err = merged.(["tree", legs + shards.(3, 3 => { tree: "c" * 40 })])
+  ok(v == 1 && err.include?("reports name 2 trees"), "merge refuses reports from two trees")
+  v, _, err = merged.(["noleg", shards.(3)])
+  ok(v == 1 && err.include?("gate-bench: no report"), "merge refuses a run without every other leg")
+end
+
 if $fails > 0
   puts "gate-tool-test: #{$fails} FAILED"
   exit 1

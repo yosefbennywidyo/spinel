@@ -9,12 +9,14 @@ module Gate
     cache="vendor/prism vendor/rbs build/rubyspec build/optcarrot build/rubyboy"
     for d in $cache; do [ -d /cache/$d ] && mkdir -p $(dirname $d) && cp -a /cache/$d $d; done
     chown -R gate:gate /src
-    runuser -u gate -- env HOME=/home/gate PATH="$PATH" GATE_JOBS="$GATE_JOBS" bash -c 'cd /src && git init -q && git add -A &&
+    runuser -u gate -- env HOME=/home/gate PATH="$PATH" GATE_JOBS="$GATE_JOBS" GATE_TARGET="$GATE_TARGET" TEST_SHARD="$TEST_SHARD" bash -c 'cd /src && git init -q && git add -A &&
       git -c user.email=gate@local -c user.name=gate commit -qm gate &&
-      for i in 1 2 3 4 5; do make deps >/dev/null 2>&1 && break; sleep 5; done; make -j${GATE_JOBS:-$(nproc)} gate 2>&1'
+      for i in 1 2 3 4 5; do make deps >/dev/null 2>&1 && break; sleep 5; done;
+      t=${GATE_TARGET:-gate}; [ "$t" = gate ] || make -j${GATE_JOBS:-$(nproc)} all 2>&1; make -j${GATE_JOBS:-$(nproc)} "$t" 2>&1'
     rc=$?
     for d in $cache; do [ -d $d ] && [ ! -d /cache/$d ] && mkdir -p /cache/$(dirname $d) && cp -a $d /cache/$d; done
     echo "@@platform linux-$(uname -m) gcc-$(gcc -dumpfullversion)"
+    echo "@@done ${GATE_TARGET:-gate} rc=$rc"
     exit $rc
   SH
 
@@ -160,7 +162,90 @@ module Gate
     check(change)
   end
 
-  def linux
+  # `--shard K/N`: the K-th of N slices of the corpus, 1-based. nil unless
+  # 1 <= K <= N.
+  def parse_shard(spec)
+    k, n = spec.to_s.split("/", 2).map { |x| Integer(x, exception: false) }
+    k && n && n >= 1 && k.between?(1, n) ? [k, n] : nil
+  end
+
+  # The legs of `make gate` that a sharded run must still pass, unsharded, in
+  # one report each (gate-rubyspec only when GATE_RUBYSPEC is not 0).
+  def required_legs
+    %w[gate-test gate-bench gate-optcarrot gate-rubyboy gate-props] + (ENV["GATE_RUBYSPEC"] == "0" ? [] : %w[gate-rubyspec])
+  end
+
+  # The report beside a run's log: one key=value per line, read by merge.
+  def write_report(path, fields)
+    File.write(path, fields.map { |k, v| "#{k}=#{v}\n" }.join)
+  end
+
+  def read_report(path)
+    File.readlines(path, chomp: true).filter_map { |l| l.split("=", 2) if l.include?("=") }.to_h
+  end
+
+  # Merges shard reports into one verdict. It names itself `gate-sharded`, not
+  # `gate:`: no single `make gate` ran, so the official line never appears.
+  def merge(paths)
+    reports = paths.map { |p| read_report(p) }
+    problems = []
+    trees = reports.map { _1["tree"] }.uniq
+    masters = reports.map { _1["master"] }.uniq
+    problems << "reports name #{trees.size} trees; they must name one" unless trees.size == 1
+    problems << "reports name #{masters.size} masters; they must name one" unless masters.size == 1
+    tests = reports.select { _1["target"] == "gate-test" }
+    sharded, whole = tests.partition { _1["shard"].to_s.include?("/") }
+    if sharded.any? && whole.any?
+      problems << "both sharded and unsharded gate-test reports"
+    elsif sharded.empty? && whole.empty?
+      problems << "no gate-test report"
+    end
+    if sharded.any?
+      ns = sharded.map { parse_shard(_1["shard"])&.last }.uniq
+      if ns.size == 1 && ns.first
+        ks = sharded.map { parse_shard(_1["shard"]).first }.sort
+        missing = (1..ns.first).to_a - ks
+        problems << "missing shards #{missing.join(",")} of #{ns.first}" unless missing.empty?
+        dups = ks.select { |k| ks.count(k) > 1 }.uniq
+        problems << "duplicate shards #{dups.join(",")}" unless dups.empty?
+      else
+        problems << "shard reports disagree on N: #{ns.inspect}"
+      end
+      sharded.reject { _1["rc"] == "0" }.each { problems << "shard #{_1["shard"]} rc=#{_1["rc"]}" }
+    end
+    whole.reject { _1["rc"] == "0" }.each { problems << "gate-test rc=#{_1["rc"]}" }
+    (required_legs - ["gate-test"]).each do |leg|
+      r = reports.find { _1["target"] == leg }
+      problems << "#{leg}: no report" unless r
+      problems << "#{leg}: rc=#{r["rc"]}" if r && r["rc"] != "0"
+    end
+    pass = tests.sum { _1["pass"].to_i }
+    fail = tests.sum { _1["fail"].to_i }
+    error = tests.sum { _1["error"].to_i }
+    problems << "tests: #{fail} fail, #{error} error" if fail + error > 0
+    if problems.empty?
+      puts "Tests: #{pass} pass, #{fail} fail, #{error} error"
+      puts "gate-sharded: ALL GREEN (tree #{trees.first[0, 12]} master #{masters.first[0, 12]})"
+      0
+    else
+      problems.each { warn "gate: #{_1}" }
+      1
+    end
+  end
+
+  def linux(argv = [])
+    target, shard = "gate", nil
+    until argv.empty?
+      case (opt = argv.shift)
+      when "--target" then target = argv.shift or abort "gate: --target needs a make target"
+      when "--shard" then shard = argv.shift or abort "gate: --shard needs K/N"
+      else abort "gate: unknown option #{opt}"
+      end
+    end
+    if shard
+      abort "gate: --shard needs K/N with 1 <= K <= N" unless parse_shard(shard)
+      abort "gate: --shard applies to gate-test only" unless target == "gate-test"
+    end
     Dir.chdir(git("rev-parse", "--show-toplevel") || abort("gate: not in a git checkout"))
     base = master or abort "gate: no upstream/master or origin/master; set GATE_MASTER"
     tree = merged_tree(base, "HEAD") or abort "gate: HEAD does not merge cleanly with #{base[0, 12]}; rebase first"
@@ -168,14 +253,19 @@ module Gate
       abort("gate: docker build of #{IMAGE} failed")
     log = ENV["GATE_LOG"] || File.join(git("rev-parse", "--git-dir"), "gate-linux.log")
     puts "gate: tree #{tree[0, 12]} merged with master #{base[0, 12]} -> #{log}"
+    ENV["GATE_TARGET"] = target
+    ENV["TEST_SHARD"] = shard.to_s
     ok = IO.popen(["git", "archive", tree]) do |archive|
-      system("docker", "run", "--rm", "-i", "-e", "GATE_JOBS", "-v", "spinel-gate-cache:/cache", IMAGE, "bash", "-c", CONTAINER,
-             in: archive, out: log, err: [:child, :out])
+      system("docker", "run", "--rm", "-i", "-e", "GATE_JOBS", "-e", "GATE_TARGET", "-e", "TEST_SHARD",
+             "-v", "spinel-gate-cache:/cache", IMAGE, "bash", "-c", CONTAINER, in: archive, out: log, err: [:child, :out])
     end
     text = File.read(log)
     puts text.lines.grep(/\A(Tests:|scale-test|gate:)/).last(7)
-    abort "gate: failed; see #{log}" unless ok && text.include?("gate: ALL GREEN")
-
+    rc = text[/^@@done #{Regexp.escape(target)} rc=(\d+)$/, 1] || "missing"
+    counts = text.scan(/^Tests: (\d+) pass, (\d+) fail, (\d+) error$/).last || [0, 0, 0]
+    write_report("#{log}.report", tree: tree, master: base, target: target, shard: shard.to_s, rc: rc,
+                 pass: counts[0], fail: counts[1], error: counts[2])
+    abort "gate: failed; see #{log}" unless ok && rc == "0" && (target != "gate" || text.include?("gate: ALL GREEN"))
   end
 end
 
@@ -183,7 +273,8 @@ if $PROGRAM_NAME == __FILE__
   case ARGV.shift
   when "check" then exit Gate.check
   when "check-range" then exit Gate.check_range(ARGV.fetch(0), ARGV.fetch(1))
-  when "linux" then Gate.linux
-  else abort "usage: ruby tools/gate.rb check | check-range BASE HEAD | linux"
+  when "linux" then Gate.linux(ARGV)
+  when "merge" then exit Gate.merge(ARGV)
+  else abort "usage: ruby tools/gate.rb check | check-range BASE HEAD | linux [--target T] [--shard K/N] | merge REPORT..."
   end
 end
