@@ -1,0 +1,87 @@
+name: gate-shards
+
+# The legs of `make gate` (Makefile: gate-test, gate-bench, gate-optcarrot,
+# gate-rubyspec, gate-props) split into parallel jobs, for a contributor's
+# fork. Lives only on `gate/**` branches: a branch = the PR's commits plus
+# this file, so the PR itself never carries it and the fork's master stays
+# identical to upstream.
+#
+# No trailer job: upstream dropped the Gate: trailer and its label workflow
+# (matz/spinel e9f552b9b, 2026-10-20). Each leg prints its own `Tests:` line.
+on:
+  push:
+    branches: ['gate/**']
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  leg:
+    name: ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # gate-test: `make test OPT=-O1`, the corpus in 8 slices; slice 1
+          # also runs the C-side test legs `test` carries.
+          - { leg: "test 1/8", cmd: "make -j$(nproc) test TEST_SHARD=1/8 OPT=-O1" }
+          - { leg: "test 2/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=2/8 OPT=-O1" }
+          - { leg: "test 3/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=3/8 OPT=-O1" }
+          - { leg: "test 4/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=4/8 OPT=-O1" }
+          - { leg: "test 5/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=5/8 OPT=-O1" }
+          - { leg: "test 6/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=6/8 OPT=-O1" }
+          - { leg: "test 7/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=7/8 OPT=-O1" }
+          - { leg: "test 8/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=8/8 OPT=-O1" }
+          # gate-rubyspec: rubyspec-gate, one suite per job. Each example is
+          # its own compile + run, so a job lasts about its example count
+          # (language 791, string 657, array 522, hash 195, integer 170,
+          # range 111). run.sh's default RUBYSPEC_JOBS is nproc-2, which is
+          # 2 workers on a 4-vCPU runner; all of them are used here.
+          - { leg: "rubyspec language", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='language'" }
+          - { leg: "rubyspec string", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/string'" }
+          - { leg: "rubyspec array", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/array'" }
+          - { leg: "rubyspec hash", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/hash'" }
+          - { leg: "rubyspec integer", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/integer'" }
+          - { leg: "rubyspec range", cmd: "RUBYSPEC_JOBS=$(nproc) make rubyspec-gate RUBYSPEC_SUITES='core/range'" }
+          # gate-props
+          - { leg: "props", cmd: "make -j$(nproc) build/spinel-work && make gate-props" }
+          # gate-bench, gate-optcarrot
+          - { leg: "bench", cmd: "make gate-bench" }
+          - { leg: "optcarrot", cmd: "make gate-optcarrot" }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - name: Fetch libprism sources
+        run: make deps
+      - name: Build
+        run: make -j$(nproc) all
+      - name: ${{ matrix.leg }}
+        run: |
+          set -o pipefail
+          ${{ matrix.cmd }} 2>&1 | tee leg.log
+      - name: Summary
+        if: always()
+        run: |
+          grep -E 'Tests:|scale-test|rubyspec-gate|bench|optcarrot|checksum|: pass|FAIL|ERR' leg.log | tail -40 || true
+      # Only the `make test`/`test-corpus` legs produce a `Tests: N pass, M
+      # fail, K error` line (the number tools/gate.rb's own `stamp` records
+      # from build/test-results/*.ok); the other legs have no such count, so
+      # an empty summary.txt from them is correct, not a miss.
+      - name: Capture result for the trailer job
+        if: always()
+        run: |
+          mkdir -p result
+          grep -E 'Tests: [0-9]+ pass' leg.log > result/summary.txt || true
+          echo "${{ matrix.leg }}" > result/leg.txt
+          echo "${{ job.status }}" > result/status.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ strategy.job-index }}
+          path: result
+          retention-days: 1
