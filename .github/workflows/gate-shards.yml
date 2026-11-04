@@ -103,9 +103,10 @@ jobs:
 
   # gate-test's second half: `tools/plan_check.sh --from-results` reads the
   # slices' reports and compiles only the programs none of them covers
-  # (benchmarks, test/reject, test/collect). Matz's gate also feeds it
-  # build/optcarrot-single.rb when `make optcarrot` has fetched it; this job
-  # does not, so its count can be a few programs short of his.
+  # (benchmarks, test/reject, test/collect) plus build/optcarrot-single.rb,
+  # which only `make optcarrot` writes (it clones optcarrot and packs it). In
+  # Matz's gate that file exists only if gate-optcarrot finished before this
+  # step; here `make optcarrot` runs first so the program is always checked.
   plan-check:
     name: plan-check
     needs: corpus
@@ -125,6 +126,8 @@ jobs:
           pattern: plan-*
           path: build/test-results
           merge-multiple: true
+      - name: Pack optcarrot (build/optcarrot-single.rb)
+        run: make optcarrot
       - name: plan-check
         run: |
           set -o pipefail
@@ -199,6 +202,11 @@ jobs:
         run: make deps
       - name: Build
         run: make -j$(nproc) all
+      # imemo-shadow-test (in gate-props) adds build/optcarrot-single.rb to its
+      # programs when that file exists, and only `make optcarrot` writes it.
+      - name: Pack optcarrot (build/optcarrot-single.rb)
+        if: matrix.leg == 'props'
+        run: make optcarrot
       - name: ${{ matrix.leg }}
         run: |
           set -o pipefail
