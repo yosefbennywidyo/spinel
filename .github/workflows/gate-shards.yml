@@ -1,0 +1,224 @@
+name: gate-shards
+
+# The legs of `make gate` (Makefile: `gate-legs` = gate-rubyspec, gate-test,
+# gate-bench, gate-optcarrot, gate-rubyboy, gate-pkg-ondemand, gate-props) split into parallel
+# jobs, for a contributor's fork. Lives only on `gate/**` branches: a branch =
+# the PR's commits plus this file, so the PR itself never carries it and the
+# fork's master stays identical to upstream.
+#
+# The file keeps its old name, "17job", from when it ran 17 jobs. Revised
+# 2026-11-04 against the Makefile of master 47d6bc11d, it ran 21; 2026-11-09 it
+# gained gate-pkg-ondemand (master 719eae492) and ran 22; 2026-11-14 it gained
+# gate-method-table (master 98ed5f13f) and runs 23:
+#   coverage    1   fails when this file and the Makefile disagree (below)
+#   corpus      8   gate-test: `make test OPT=-O1 TEST_PLAN_CHECK=--plan-check`
+#   plan-check  1   gate-test's second half: tools/plan_check.sh --from-results
+#   rubyspec    7   gate-rubyspec: all RUBYSPEC_SUITES, language in two halves
+#   leg         6   gate-props, gate-bench, gate-optcarrot, gate-rubyboy, gate-pkg-ondemand,
+#                   gate-method-table
+#
+# No trailer job: upstream dropped the Gate: trailer and its label workflow
+# (matz/spinel e9f552b9b, 2026-10-20). Each leg prints its own `Tests:` line.
+#
+# KEEP IN STEP WITH THE MAKEFILE. This file once covered 6 of the 22
+# RUBYSPEC_SUITES and none of gate-rubyboy or plan-check, and its green runs
+# said less than Matz's gate. The `coverage` job now fails when RUBYSPEC_SUITES
+# or `gate-legs` gains something no job here runs. Fix that by adding a
+# matrix entry, not by loosening the check.
+on:
+  push:
+    branches: ['gate/**']
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - name: Every Makefile gate leg and rubyspec suite has a job here
+        run: |
+          ruby -ryaml -e '
+            wf = YAML.load_file(".github/workflows/" + File.basename(ENV.fetch("GITHUB_WORKFLOW_REF").split("@").first))
+            mk = File.read("Makefile")
+            matrix = ->(job) { wf["jobs"][job]["strategy"]["matrix"]["include"] }
+            want = mk[/^RUBYSPEC_SUITES\s*:=\s*(.*)$/, 1].split
+            have = matrix.("rubyspec").flat_map { |e| e["suites"].split }.uniq
+            cmds = matrix.("leg").map { |e| e["cmd"] }.join(" ")
+            legs = mk[/^gate-legs:(.*)$/, 1].scan(/gate-[a-z]+/) - %w[gate-rubyspec gate-test]
+            bad = []
+            bad << "RUBYSPEC_SUITES not run here: #{(want - have).join(" ")}" unless (want - have).empty?
+            bad << "suites run here but not in the Makefile: #{(have - want).join(" ")}" unless (have - want).empty?
+            bad << "gate-legs has no leg here: #{legs.reject { |l| cmds.include?(l) }.join(" ")}" unless legs.all? { |l| cmds.include?(l) }
+            abort "coverage: " + bad.join("; ") unless bad.empty?
+            puts "coverage: #{want.size} rubyspec suites and #{legs.size} further gate legs are all covered"
+          '
+
+  # gate-test. Every slice compiles with --plan-check (the flag adds report
+  # lines only; the emitted C is the same) and keeps each program's report,
+  # which the plan-check job reads. Slice 1 also runs the C-side legs `test`
+  # carries beyond `test-corpus`.
+  corpus:
+    name: ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: "test 1/8", cmd: "make -j$(nproc) test TEST_SHARD=1/8 OPT=-O1 TEST_PLAN_CHECK=--plan-check" }
+          - { leg: "test 2/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=2/8 OPT=-O1 TEST_PLAN_CHECK=--plan-check" }
+          - { leg: "test 3/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=3/8 OPT=-O1 TEST_PLAN_CHECK=--plan-check" }
+          - { leg: "test 4/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=4/8 OPT=-O1 TEST_PLAN_CHECK=--plan-check" }
+          - { leg: "test 5/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=5/8 OPT=-O1 TEST_PLAN_CHECK=--plan-check" }
+          - { leg: "test 6/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=6/8 OPT=-O1 TEST_PLAN_CHECK=--plan-check" }
+          - { leg: "test 7/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=7/8 OPT=-O1 TEST_PLAN_CHECK=--plan-check" }
+          - { leg: "test 8/8", cmd: "make -j$(nproc) test-corpus TEST_SHARD=8/8 OPT=-O1 TEST_PLAN_CHECK=--plan-check" }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - name: Fetch libprism sources
+        run: make deps
+      - name: Build
+        run: make -j$(nproc) all
+      - name: ${{ matrix.leg }}
+        run: |
+          set -o pipefail
+          ${{ matrix.cmd }} 2>&1 | tee leg.log
+      - name: Summary
+        if: always()
+        run: |
+          grep -E 'Tests:|FAIL|ERR' leg.log | tail -40 || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ strategy.job-index }}
+          path: build/test-results/**/*.plan
+          retention-days: 1
+
+  # gate-test's second half: `tools/plan_check.sh --from-results` reads the
+  # slices' reports and compiles only the programs none of them covers
+  # (benchmarks, test/reject, test/collect) plus build/optcarrot-single.rb,
+  # which only `make optcarrot` writes (it clones optcarrot and packs it). In
+  # Matz's gate that file exists only if gate-optcarrot finished before this
+  # step; here `make optcarrot` runs first so the program is always checked.
+  plan-check:
+    name: plan-check
+    needs: corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - name: Fetch libprism sources
+        run: make deps
+      - name: Build
+        run: make -j$(nproc) all
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: plan-*
+          path: build/test-results
+          merge-multiple: true
+      - name: Pack optcarrot (build/optcarrot-single.rb)
+        run: make optcarrot
+      - name: plan-check
+        run: |
+          set -o pipefail
+          tools/plan_check.sh --from-results build/test-results 2>&1 | tee leg.log
+      - name: Summary
+        if: always()
+        run: |
+          grep -E '^plan-check:' leg.log | tail -40 || true
+
+  # gate-rubyspec: rubyspec-gate, every suite of RUBYSPEC_SUITES. Each example
+  # is its own compile + run, so a job lasts about its expected-PASS count
+  # (tools/rubyspec/expectations/*.tsv, 2026-11-04): language 1340, string 858,
+  # array 819, integer 347, hash 297, time 232, range 210, float 200,
+  # math 166, matchdata 154, symbol 123, set 111, exception 103, rational 96,
+  # struct 93, proc 92, regexp 88, complex 84, random 58, nil 21, true 7,
+  # false 7. Groups below hold 670-875 each. RUBYSPEC_SHARD=k/n keeps every
+  # n-th example of each suite in the job, and each shard still checks that
+  # everything it listed ran. run.sh defaults to nproc-2 workers, which is 2
+  # on a 4-vCPU runner; all of them are used here.
+  rubyspec:
+    name: rubyspec ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: "language 1/2", suites: "language", shard: "1/2" }
+          - { leg: "language 2/2", suites: "language", shard: "2/2" }
+          - { leg: "string", suites: "core/string", shard: "" }
+          - { leg: "array", suites: "core/array", shard: "" }
+          - { leg: "integer hash range", suites: "core/integer core/hash core/range", shard: "" }
+          - { leg: "time float math matchdata symbol", suites: "core/time core/float core/math core/matchdata core/symbol", shard: "" }
+          - { leg: "set exception rational struct proc regexp complex random nil true false", suites: "core/set core/exception core/rational core/struct core/proc core/regexp core/complex core/random core/nil core/true core/false", shard: "" }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - name: Fetch libprism sources
+        run: make deps
+      - name: Build
+        run: make -j$(nproc) all
+      - name: rubyspec ${{ matrix.leg }}
+        run: |
+          set -o pipefail
+          RUBYSPEC_JOBS=$(nproc) RUBYSPEC_SHARD='${{ matrix.shard }}' make rubyspec-gate RUBYSPEC_SUITES='${{ matrix.suites }}' 2>&1 | tee leg.log
+      - name: Summary
+        if: always()
+        run: |
+          grep -E 'rubyspec-gate' leg.log | tail -40 || true
+
+  # gate-props, gate-bench, gate-optcarrot, gate-rubyboy, gate-pkg-ondemand
+  leg:
+    name: ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: "props", cmd: "make -j$(nproc) build/spinel-work && make gate-props" }
+          - { leg: "bench", cmd: "make gate-bench" }
+          - { leg: "optcarrot", cmd: "make gate-optcarrot" }
+          - { leg: "rubyboy", cmd: "make gate-rubyboy" }
+          - { leg: "pkg-ondemand", cmd: "make gate-pkg-ondemand" }
+          # gate-method-table depends on gate-optcarrot (it reads build/optcarrot-single.rb),
+          # so make runs that leg first inside this job.
+          - { leg: "method-table", cmd: "make gate-method-table" }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - name: Fetch libprism sources
+        run: make deps
+      - name: Build
+        run: make -j$(nproc) all
+      # imemo-shadow-test (in gate-props) adds build/optcarrot-single.rb to its
+      # programs when that file exists, and only `make optcarrot` writes it.
+      - name: Pack optcarrot (build/optcarrot-single.rb)
+        if: matrix.leg == 'props'
+        run: make optcarrot
+      - name: ${{ matrix.leg }}
+        run: |
+          set -o pipefail
+          ${{ matrix.cmd }} 2>&1 | tee leg.log
+      - name: Summary
+        if: always()
+        run: |
+          grep -E 'scale-test|bench|optcarrot|Rubyboy|checksum|: pass|FAIL|ERR' leg.log | tail -40 || true
