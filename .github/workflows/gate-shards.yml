@@ -8,12 +8,14 @@ name: gate-shards
 #
 # The file keeps its old name, "17job", from when it ran 17 jobs. Revised
 # 2026-11-04 against the Makefile of master 47d6bc11d, it ran 21; 2026-11-09 it
-# gained gate-pkg-ondemand (master 719eae492) and runs 22:
+# gained gate-pkg-ondemand (master 719eae492) and ran 22; 2026-11-14 it gained
+# gate-method-table (master 98ed5f13f) and runs 23:
 #   coverage    1   fails when this file and the Makefile disagree (below)
 #   corpus      8   gate-test: `make test OPT=-O1 TEST_PLAN_CHECK=--plan-check`
 #   plan-check  1   gate-test's second half: tools/plan_check.sh --from-results
 #   rubyspec    7   gate-rubyspec: all RUBYSPEC_SUITES, language in two halves
-#   leg         5   gate-props, gate-bench, gate-optcarrot, gate-rubyboy, gate-pkg-ondemand
+#   leg         6   gate-props, gate-bench, gate-optcarrot, gate-rubyboy, gate-pkg-ondemand,
+#                   gate-method-table
 #
 # No trailer job: upstream dropped the Gate: trailer and its label workflow
 # (matz/spinel e9f552b9b, 2026-10-20). Each leg prints its own `Tests:` line.
@@ -195,6 +197,9 @@ jobs:
           - { leg: "optcarrot", cmd: "make gate-optcarrot" }
           - { leg: "rubyboy", cmd: "make gate-rubyboy" }
           - { leg: "pkg-ondemand", cmd: "make gate-pkg-ondemand" }
+          # gate-method-table depends on gate-optcarrot (it reads build/optcarrot-single.rb),
+          # so make runs that leg first inside this job.
+          - { leg: "method-table", cmd: "make gate-method-table" }
     steps:
       - uses: actions/checkout@v6
       - uses: ruby/setup-ruby@v1
